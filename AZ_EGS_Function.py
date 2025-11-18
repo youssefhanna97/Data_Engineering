@@ -1,4 +1,6 @@
-# Azure Event Grid System Topic
+# Azure Event Grid System
+# Creating Event Grid System Topic 
+# Create Event Subscription as a webhook with the function url 
 
 import azure.functions as func
 import logging
