@@ -1,0 +1,159 @@
+#its the vile for the case
+# check destintation firs
+
+
+import azure.functions as func
+import logging
+import os
+import gzip
+import zlib
+from azure.storage.blob import BlobServiceClient
+import io
+from io import BytesIO
+import traceback
+import json
+from urllib.parse import urlparse
+
+# --- CONFIGURATION ---
+app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+
+# Environment variables (set these in Azure App Settings)
+SRC_PREFIX = os.getenv("SRC_PREFIX")
+DEST_PREFIX = os.getenv("DEST_PREFIX")
+DEST_CONTAINER = os.getenv("DEST_CONTAINER")
+STORAGE_CONN_STR = os.getenv("mainblobstorage")
+
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+
+CHUNK_SIZE = 1024 * 1024 * 8   # 8MB streaming chunks
+
+# --- MAIN FUNCTION ---
+@app.route(route="http_trigger", methods=["POST"])
+def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        logging.info('starting the function')
+
+        # Parse the Event Grid message
+        events = req.get_json()
+        if not isinstance(events, list):
+            events = [events]
+
+        logging.info('Parsed the event grid')
+
+        blob_service_client = BlobServiceClient.from_connection_string(STORAGE_CONN_STR)
+        processed_files = []
+
+        logging.info('storage connection is ok')
+
+        for event in events:
+            # Handle Event Grid validation handshake
+            if event.get("eventType") == "Microsoft.EventGrid.SubscriptionValidationEvent":
+                validation_code = event["data"]["validationCode"]
+                logging.info(f"Responding to Event Grid validation with code: {validation_code}")
+                return func.HttpResponse(
+                    json.dumps({"validationResponse": validation_code}),
+                    mimetype="application/json"
+                )
+
+            # Handle blob created event
+            elif event.get("eventType") == "Microsoft.Storage.BlobCreated":
+                blob_url = event["data"]["url"]
+                parsed = urlparse(blob_url)
+                container_name, blob_name = parsed.path.lstrip("/").split("/", 1)
+
+                logging.info(f"[START] Processing: {blob_name}")
+
+                src_blob_client  = blob_service_client.get_blob_client(container_name, blob_name)
+
+                if ".ABC" in blob_name.upper():
+                    logging.info("Detected .ABC file → using streaming large-file pipeline")
+                    src_chunks = src_blob_client.download_blob().chunks()
+                    logging.info("Downloading Blob")
+
+                    # Streaming decompressor for .Z files
+                    def stream_Z(chunks):
+                        d = zlib.decompressobj(15 + 32)
+                        for chunk in chunks:
+                            data = d.decompress(chunk)
+                            if data:
+                                yield data
+                        tail = d.flush()
+                        if tail:
+                            yield tail
+                    input_stream = stream_Z(src_chunks)
+                    logging.info("Streaming")
+
+                    # Streaming output (compressed)
+                    out_buffer = io.BytesIO()
+                    gzip_writer = gzip.GzipFile(fileobj=out_buffer, mode="wb")
+
+                    for chunk in input_stream:
+                        gzip_writer.write(chunk)
+
+                    gzip_writer.close()
+                    data_to_upload = out_buffer.getvalue()
+                
+                else:
+                    logging.info("Normal file detected → using standard workload")
+                    raw_data = src_blob_client.download_blob().readall()
+
+                    if blob_name.endswith(".Z"):
+                        try:
+                            raw_data = zlib.decompress(raw_data, 15 + 32)
+                            logging.info("Decompression successful")
+                        except Exception as dec_err:
+                            logging.warning(f"Decompression failed, might already be uncompressed: {dec_err}")
+
+                    # Detect and normalize encoding
+                    decoded_text = None
+                    used_decoding = "binary"
+                    for encoding in ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']:
+                        try:
+                            decoded_text = raw_data.decode(encoding)
+                            used_decoding = encoding
+                            break
+                        except (UnicodeDecodeError, AttributeError):
+                            continue
+
+                    # Re-encode and compress
+                    try:
+                        iso_encoded = decoded_text.encode('iso-8859-1', errors='strict') if decoded_text else raw_data
+                        used_encoding = 'iso-8859-1'
+                    except UnicodeEncodeError:
+                        iso_encoded = decoded_text.encode('utf-8') if decoded_text else raw_data
+                        used_encoding = 'utf-8'
+
+                    compressed_buffer = BytesIO()
+                    with gzip.GzipFile(fileobj=compressed_buffer, mode='wb') as gz:
+                        gz.write(iso_encoded)
+                    data_to_upload  = compressed_buffer.getvalue()
+
+                # Upload compressed file
+                dest_blob_name = f"{DEST_PREFIX}/{os.path.basename(blob_name)}"
+                dest_blob = blob_service_client.get_blob_client(DEST_CONTAINER, dest_blob_name)
+
+                dest_blob.upload_blob(
+                    data_to_upload ,
+                    overwrite=True,
+                    metadata={
+                        'original_encoding': used_decoding,
+                        'compressed_encoding': used_encoding,
+                        'source_file': blob_name,
+                        "abc_streaming": "true" if ".ABC" in blob_name.upper() else "false"
+                        }
+                    )
+
+                logging.info(f"[SUCCESS] Uploaded processed blob: {dest_blob_name}")
+                processed_files.append(blob_name)
+
+                src_blob_client.delete_blob()
+                logging.info(f"[DELETE] Deleted source blob: {blob_name}")
+
+        return func.HttpResponse(f"Processed {len(processed_files)} files", status_code=200)
+
+    except Exception:
+        logging.error("[FATAL] HTTP function failed.")
+        logging.error(traceback.format_exc())
+        return func.HttpResponse("Failed", status_code=500)
+
+
